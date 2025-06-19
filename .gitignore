@@ -1,0 +1,19 @@
+# Environnement virtuel
+venv/
+.env/
+
+# Fichiers cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers générés localement
+/models/*.joblib
+/data/
+*.db
+*.sqlite3
+
+# Fichiers IDE
+.idea/
+.vscode/
