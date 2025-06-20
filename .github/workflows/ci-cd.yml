@@ -1,6 +1,5 @@
 name: CI/CD Pipeline for Heart Disease Model
 
-# Déclenche le workflow sur les push et pull requests vers la branche 'dev'
 on:
   push:
     branches: [ dev ]
@@ -12,36 +11,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Récupère le code du repository
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2. Met en place l'environnement Python
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      # 3. Installe les dépendances
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
-      # 4. Entraîne le modèle
+
       - name: Train model
         run: python scripts/train.py
 
-      # 5. Évalue le modèle
       - name: Evaluate model
-        id: evaluate # Donne un ID à cette étape pour pouvoir réutiliser ses outputs
+        id: evaluate
         run: |
           python scripts/evaluate.py
-          # Lire le score depuis le fichier JSON et le mettre en output de l'étape
           SCORE=$(jq .accuracy metrics/metrics.json)
           echo "score=$SCORE" >> $GITHUB_OUTPUT
 
-      # 6. Étape de décision : Déployer ou non
       - name: Check score against threshold
         id: check_score
         run: |
@@ -49,26 +41,61 @@ jobs:
           THRESHOLD=${{ secrets.THRESHOLD_SCORE }}
           echo "Model Score: $SCORE"
           echo "Threshold: $THRESHOLD"
-          if (( $(echo "$SCORE >= $THRESHOLD" | bc -l) )); then
+          # Utilisation de awk pour une comparaison plus robuste des nombres à virgule
+          if $(awk -v score="$SCORE" -v threshold="$THRESHOLD" 'BEGIN {exit !(score >= threshold)}'); then
             echo "✅ Score is above threshold. Proceeding to deployment."
             echo "deploy=true" >> $GITHUB_OUTPUT
           else
             echo "❌ Score is below threshold. Deployment skipped."
             echo "deploy=false" >> $GITHUB_OUTPUT
           fi
-
-      # 7. Déployer sur Hugging Face SI le score est suffisant
+          
+      # --- BLOC DE DÉPLOIEMENT ---
       - name: Deploy to Hugging Face Hub
         if: steps.check_score.outputs.deploy == 'true'
         env:
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
         run: python scripts/deploy.py
         
-      # 8. Envoyer une notification par email (SUCCÈS)
-      - name: Send success email notification
+      - name: Generate static site for results (Deployment Case)
+        if: steps.check_score.outputs.deploy == 'true'
+        run: |
+          mkdir -p site
+          echo "<html><body>" > site/index.html
+          echo "<h1>Résultats du Modèle de Prédiction Cardiaque</h1>" >> site/index.html
+          echo "<h2>Statut : DÉPLOYÉ AVEC SUCCÈS</h2>" >> site/index.html
+          echo "<p>Dernière mise à jour : $(date)</p>" >> site/index.html
+          echo "<h3>Score d'Accuracy : ${{ steps.evaluate.outputs.score }} (Seuil : ${{ secrets.THRESHOLD_SCORE }})</h3>" >> site/index.html
+          echo "<p>Le modèle a été déployé car le score est supérieur ou égal au seuil.</p>" >> site/index.html
+          echo "<p>Lien vers le modèle sur Hugging Face : <a href='https://huggingface.co/NchourupouoM/heart-disease-classifier'>Voir le modèle</a></p>" >> site/index.html
+          echo "</body></html>" >> site/index.html
+
+      - name: Generate static site for results (Non-Deployment Case)
+        if: steps.check_score.outputs.deploy == 'false'
+        run: |
+          mkdir -p site
+          echo "<html><body>" > site/index.html
+          echo "<h1>Résultats du Modèle de Prédiction Cardiaque</h1>" >> site/index.html
+          echo "<h2>Statut : DÉPLOIEMENT REFUSÉ</h2>" >> site/-index.html
+          echo "<p>Dernière mise à jour : $(date)</p>" >> site/index.html
+          echo "<h3>Score d'Accuracy : ${{ steps.evaluate.outputs.score }} (Seuil Requis : ${{ secrets.THRESHOLD_SCORE }})</h3>" >> site/index.html
+          echo "<p>Le modèle n'a pas été déployé car le score est inférieur au seuil requis.</p>" >> site/index.html
+          echo "</body></html>" >> site/index.html
+          
+      - name: Deploy to GitHub Pages
+        # Cette étape s'exécute toujours si le job réussit jusqu'ici
+        if: success()
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: site
+          
+      # --- BLOC DE NOTIFICATIONS (PLUS CLAIR) ---
+      - name: Send success email notification (Deployment)
         if: success() && steps.check_score.outputs.deploy == 'true'
         uses: dawidd6/action-send-mail@v3
         with:
+          # ... (contenu de l'email de succès, inchangé)
           server_address: smtp.gmail.com
           server_port: 465
           username: ${{ secrets.SMTP_USER }}
@@ -83,22 +110,41 @@ jobs:
           to: ${{ secrets.ADMIN_EMAIL }},${{ github.event.pusher.email }}
           from: GitHub Actions Notifier <${{ secrets.SMTP_USER }}>
 
-      # 9. Envoyer une notification par email (ÉCHEC)
-      - name: Send failure email notification
-        if: failure() || steps.check_score.outputs.deploy == 'false'
+      - name: Send failure email notification (Low Score)
+        if: success() && steps.check_score.outputs.deploy == 'false'
         uses: dawidd6/action-send-mail@v3
         with:
+          # ... (contenu de l'email d'échec, mais spécifique au score bas)
           server_address: smtp.gmail.com
           server_port: 465
           username: ${{ secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
-          subject: "❌ [ÉCHEC] Validation du modèle Heart Disease"
+          subject: "ℹ️ [INFO] Non-déploiement du modèle Heart Disease (Score trop bas)"
           body: |
             Bonjour,
-            La validation du modèle de classification des maladies cardiaques a échoué.
+            La validation du modèle de classification des maladies cardiaques a réussi, mais le score est trop bas pour un déploiement.
             Score d'accuracy obtenu : ${{ steps.evaluate.outputs.score }} (Seuil requis : ${{ secrets.THRESHOLD_SCORE }})
-            Le déploiement a été annulé.
+            Le déploiement a été annulé. Aucune action n'est requise, sauf si une amélioration du modèle est souhaitée.
             Commit par : ${{ github.actor }}
-            Lien vers les logs du workflow pour analyse : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Lien vers les logs du workflow : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ${{ secrets.ADMIN_EMAIL }},${{ github.event.pusher.email }}
+          from: GitHub Actions Notifier <${{ secrets.SMTP_USER }}>
+
+      - name: Send failure email notification (Job Failed)
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          # ... (contenu de l'email d'échec pour une VRAIE erreur)
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "❌ [ÉCHEC] Le workflow CI/CD a échoué"
+          body: |
+            Bonjour,
+            Le workflow pour le modèle Heart Disease a échoué en raison d'une erreur.
+            Merci de consulter les logs pour diagnostiquer le problème.
+            Commit par : ${{ github.actor }}
+            Lien vers les logs du workflow : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           to: ${{ secrets.ADMIN_EMAIL }},${{ github.event.pusher.email }}
           from: GitHub Actions Notifier <${{ secrets.SMTP_USER }}>
